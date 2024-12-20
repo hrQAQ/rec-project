@@ -8,6 +8,7 @@ Reference:
 
 import torch
 import torch.nn as nn
+import time
 
 from .basemodel import BaseModel
 from ..inputs import combined_dnn_input
@@ -47,6 +48,8 @@ class xDeepFM(BaseModel):
         super(xDeepFM, self).__init__(linear_feature_columns, dnn_feature_columns, l2_reg_linear=l2_reg_linear,
                                       l2_reg_embedding=l2_reg_embedding, init_std=init_std, seed=seed, task=task,
                                       device=device, gpus=gpus)
+        self.cin_compute_time = 0
+        self.dnn_compute_time = 0
         self.dnn_hidden_units = dnn_hidden_units
         self.use_dnn = len(dnn_feature_columns) > 0 and len(dnn_hidden_units) > 0
         if self.use_dnn:
@@ -77,19 +80,24 @@ class xDeepFM(BaseModel):
         self.to(device)
 
     def forward(self, X):
-
         sparse_embedding_list, dense_value_list = self.input_from_feature_columns(X, self.dnn_feature_columns,
                                                                                   self.embedding_dict)
 
         linear_logit = self.linear_model(X)
         if self.use_cin:
+            t1 = time.time()
             cin_input = torch.cat(sparse_embedding_list, dim=1)
             cin_output = self.cin(cin_input)
             cin_logit = self.cin_linear(cin_output)
+            t2 = time.time()
+            self.cin_compute_time += t2 - t1
         if self.use_dnn:
+            t1 = time.time()
             dnn_input = combined_dnn_input(sparse_embedding_list, dense_value_list)
             dnn_output = self.dnn(dnn_input)
             dnn_logit = self.dnn_linear(dnn_output)
+            t2 = time.time()
+            self.dnn_compute_time += t2 - t1
 
         if len(self.dnn_hidden_units) == 0 and len(self.cin_layer_size) == 0:  # only linear
             final_logit = linear_logit

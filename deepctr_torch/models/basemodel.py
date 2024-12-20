@@ -29,6 +29,32 @@ from ..inputs import build_input_features, SparseFeat, DenseFeat, VarLenSparseFe
 from ..layers import PredictionLayer
 from ..layers.utils import slice_arrays
 from ..callbacks import History
+import subprocess
+
+def get_gpu_stats():
+    result = subprocess.run(['nvidia-smi', '--query-gpu=memory.used,memory.free,utilization.gpu,utilization.memory', '--format=csv,noheader,nounits'], 
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    stats = result.stdout.decode('utf-8').strip().split('\n')
+    gpu_stats = []
+    for stat in stats:
+        if stat.strip():
+            memory_used, memory_free, gpu_util, mem_util = map(int, stat.split(','))
+            gpu_stats.append({
+                'memory_used': memory_used,
+                'memory_free': memory_free,
+                'gpu_util': gpu_util,
+                'mem_util': mem_util
+            })
+    return gpu_stats
+
+# 在训练中记录 GPU 使用情况
+def log_gpu_usage(epoch, global_step, writer):
+    gpu_stats = get_gpu_stats()
+    for i, stats in enumerate(gpu_stats):
+        writer.add_scalar(f'gpu{i}/memory_used', stats['memory_used'], global_step)
+        writer.add_scalar(f'gpu{i}/memory_free', stats['memory_free'], global_step)
+        writer.add_scalar(f'gpu{i}/gpu_util', stats['gpu_util'], global_step)
+        writer.add_scalar(f'gpu{i}/mem_util', stats['mem_util'], global_step)
 
 
 class Linear(nn.Module):
@@ -76,8 +102,9 @@ class Linear(nn.Module):
 
         sparse_embedding_list += varlen_embedding_list
 
-        linear_logit = torch.zeros([X.shape[0], 1]).to(self.device)
+        linear_logit = torch.zeros([X.shape[0], 1])
         if len(sparse_embedding_list) > 0:
+            linear_logit = linear_logit.to(sparse_embedding_list[0].device)
             sparse_embedding_cat = torch.cat(sparse_embedding_list, dim=-1)
             if sparse_feat_refine_weight is not None:
                 # w_{x,i}=m_{x,i} * w_i (in IFM and DIFM)
@@ -85,8 +112,12 @@ class Linear(nn.Module):
             sparse_feat_logit = torch.sum(sparse_embedding_cat, dim=-1, keepdim=False)
             linear_logit += sparse_feat_logit
         if len(dense_value_list) > 0:
+            linear_logit = linear_logit.to(dense_value_list[0].device)
             dense_value_logit = torch.cat(
                 dense_value_list, dim=-1).matmul(self.weight)
+            # print dtype of weight and dense_value_list
+            # print("weight dtype: {}, dense_value_list dtype: {}".format(self.weight.dtype, torch.cat(
+            #     dense_value_list, dim=-1).dtype))
             linear_logit += dense_value_logit
 
         return linear_logit
@@ -135,7 +166,7 @@ class BaseModel(nn.Module):
         self.history = History()
 
     def fit(self, x=None, y=None, batch_size=None, epochs=1, verbose=1, initial_epoch=0, validation_split=0.,
-            validation_data=None, shuffle=True, callbacks=None):
+            validation_data=None, shuffle=True, callbacks=None, writer=None):
         """
 
         :param x: Numpy array of training data (if the model has a single input), or list of Numpy arrays (if the model has multiple inputs).If input layers in the model are named, you can also pass a
@@ -238,7 +269,9 @@ class BaseModel(nn.Module):
             train_result = {}
             try:
                 with tqdm(enumerate(train_loader), disable=verbose != 1) as t:
-                    for _, (x_train, y_train) in t:
+                    alreay_spent_time = 0
+                    for i, (x_train, y_train) in t:
+                        start = time.time()
                         x = x_train.to(self.device).float()
                         y = y_train.to(self.device).float()
 
@@ -265,9 +298,29 @@ class BaseModel(nn.Module):
                             for name, metric_fun in self.metrics.items():
                                 if name not in train_result:
                                     train_result[name] = []
-                                train_result[name].append(metric_fun(
-                                    y.cpu().data.numpy(), y_pred.cpu().data.numpy().astype("float64")))
-
+                                try:
+                                    train_result[name].append(metric_fun(
+                                        y.cpu().data.numpy(), y_pred.cpu().data.numpy().astype("float64")))
+                                except ValueError:
+                                    pass
+                        end = time.time()
+                        alreay_spent_time += end - start
+                        import sys
+                        # eg. Epoch 1/10 Iter 1/100 [>-----------------------------] - loss: 0.6931 - expected time: 0.6931/100s
+                        sys.stdout.write('\r')
+                        sys.stdout.write("Epoch {0}/{1} Iter {2}/{3} [".format(epoch + 1, epochs, i + 1, steps_per_epoch))
+                        for j in range(1, 51):
+                            if j <= (i + 1) / steps_per_epoch * 50:
+                                sys.stdout.write("=")
+                            else:
+                                sys.stdout.write("-")
+                        sys.stdout.write("] - loss: {:.4f} - expected time: {:.4f}/{:.4f}s".format(
+                            total_loss.item()/batch_size, alreay_spent_time, alreay_spent_time / (i + 1) * steps_per_epoch))
+                        sys.stdout.flush()
+                        writer.add_scalar('loss', total_loss.item()/batch_size, epoch * steps_per_epoch + i)
+                        log_gpu_usage(epoch, epoch * steps_per_epoch + i, writer)
+                        
+                    sys.stdout.write('\n')
 
             except KeyboardInterrupt:
                 t.close()
